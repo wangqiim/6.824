@@ -48,6 +48,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,8 +69,15 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm	int
 	votedFor 	int
-	log 		[]interface{}
+	log 		[]*LogEntry
 	state		int
+
+	commitIndex	int	//index of highest log entry known to "be committed"    initialized to 0
+	lastApplied	int	//index of highest log entry applied to "state machine"   initialized to 0
+	
+	//仅leader，易失状态，成为leader时重置
+	nextIndex	[]int	//initialized to leader last log index + 1
+	matchIndex	[]int //	(initialized to leader
 
 	electTimeTick		int	//0 -> electDuration
 	heartbeatTick		int	//0 -> hearbeatDuration
@@ -147,6 +160,11 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term 			int
 	LeaderId		int	//so follower can redirect clients
+
+	PrevLogIndex	int 
+	PrevLogTerm		int
+	Entries			[]interface{}
+	leaderCommit	int
 }
 
 type AppendEntriesReply struct {
@@ -160,7 +178,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%d] received request vote from %d", rf.me, args.CandidateId)
+	// DPrintf("[%d] received request vote from %d", rf.me, args.CandidateId)
 	if (args.Term < rf.currentTerm) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -228,7 +246,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-	// Your code here (2B).
+	// Your code here (2B)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if (rf.state != LEADER) {
+		return -1, -1 ,false
+	}
+	rf.log = append(rf.log, &LogEntry{command, term})
+	index = len(rf.log)
+	term = rf.currentTerm
+	DPrintf("[%d] start agreement, index=%d, currentTerm = %d", rf.me, index, term)
 	return index, term, isLeader
 }
 
@@ -265,14 +292,15 @@ func (rf *Raft) killed() bool {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make (	peers 		[]*labrpc.ClientEnd, 
+func Make(	peers 		[]*labrpc.ClientEnd, 
 			me 			int,
 			persister 	*Persister, 
 			applyCh 	chan ApplyMsg) *Raft {
+	// DPrintf("applyCh = %v", <-applyCh)
 	// Your initialization code here (2A, 2B, 2C).
 	//rand.Seed(time.Now().UnixNano())
 	duration := rand.Intn(150) + 150	//[150,300)
-	DPrintf("[%d] Make and duration is %d MilliSecond", me, duration)
+	// DPrintf("[%d] Make and duration is %d MilliSecond", me, duration)
 	rf := &Raft{peers:			peers, 
 				persister:		persister, 
 				me: 			me,
@@ -284,6 +312,7 @@ func Make (	peers 		[]*labrpc.ClientEnd,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.Run()
+	// go rf.applyLogLoop(applyCh)
 	return rf
 }
 
@@ -323,8 +352,10 @@ func (rf *Raft) TimeTick(timeInc int) {
 	if (rf.state == LEADER) {
 		rf.heartbeatTick += timeInc
 		if (rf.heartbeatTick == 100) {	//到点了，发心跳包
+			rf.heartbeatTick = 0
+			term := rf.currentTerm
 			rf.mu.Unlock()
-			rf.Heartbeat()
+			go rf.Heartbeat(term)
 		} else {
 			rf.mu.Unlock()
 		}
@@ -332,17 +363,18 @@ func (rf *Raft) TimeTick(timeInc int) {
 		rf.electTimeTick += timeInc
 		if (rf.electTimeTick == rf.electDuration) {	//到点了，重新选举
 			rf.ConvToCandidate()
+			term := rf.currentTerm
 			rf.mu.Unlock()
-			rf.AttemptElection()
+			go rf.AttemptElection(term)
 		} else {
 			rf.mu.Unlock()
 		}
 	}
 }
 
-func (rf *Raft) AttemptElection() {
+func (rf *Raft) AttemptElection(electTerm int) {
 	rf.mu.Lock()
-	if (rf.state != CANDIDATE) { //double check
+	if (rf.state != CANDIDATE || rf.currentTerm != electTerm) { //double check
 		rf.mu.Unlock()
 		return;
 	}
@@ -363,7 +395,7 @@ func (rf *Raft) AttemptElection() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			votes++
-			DPrintf("[%d] got vote from %d", rf.me, server)
+			// DPrintf("[%d] got vote from %d", rf.me, server)
 			if (done || votes <= len(rf.peers) / 2) {
 				return
 			}
@@ -378,11 +410,11 @@ func (rf *Raft) AttemptElection() {
 }
 
 func (rf *Raft) CallRequestVote(term int, server int) bool {
-	DPrintf("[%d] sending request vote to %d", rf.me, server)
+	// DPrintf("[%d] sending request vote to %d", rf.me, server)
 	args := RequestVoteArgs{Term: term, CandidateId: rf.me}
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, &args, &reply)
-	DPrintf("[%d] finish sending request vote to %d, ok = %v", rf.me, server, ok)
+	// DPrintf("[%d] finish sending request vote to %d, ok = %v", rf.me, server, ok)
 	if (ok == false) {	//sendRequestVote can't arrive
 		return false
 	}
@@ -396,10 +428,13 @@ func (rf *Raft) CallRequestVote(term int, server int) bool {
 	return reply.VoteGranted;
 }
 
-func (rf *Raft) Heartbeat() {
+func (rf *Raft) Heartbeat(heartbeatTerm int) {
 	rf.mu.Lock()
+	if (heartbeatTerm != rf.currentTerm) {
+		rf.mu.Unlock()
+		return
+	}
 	DPrintf("[%d] Heartbeat at term %d", rf.me, rf.currentTerm)
-	rf.heartbeatTick = 0
 	rf.mu.Unlock()
 	for server, _ := range rf.peers {
 		if (server == rf.me) {	// rf.peers is [0, 2, 3, 4, 5, 6] ??? right????
@@ -422,8 +457,8 @@ func (rf *Raft) CallAppendEntries(server int) bool {
 	}
 	//do thing
 	rf.mu.Lock()
-	if (reply.Term > rf.currentTerm && reply.Success == true) {
-		rf.ConvToFollower(reply.Term, server)
+	if (reply.Term > rf.currentTerm) {
+		rf.ConvToFollower(reply.Term, -1)
 	}
 	rf.mu.Unlock()
 	return reply.Success
@@ -440,20 +475,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	DPrintf("[%d] received AppendEntries from %d", rf.me, args.LeaderId)
 	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
 	if (args.Term < rf.currentTerm) {
-		reply.Term = rf.currentTerm
 		reply.Success = false
-	} else if (args.Term == rf.currentTerm) {
-		reply.Term = rf.currentTerm
-		if (rf.votedFor == args.LeaderId) {
-			rf.electTimeTick = 0
-			reply.Success = true
-		} else {		//应该不会进入这种情况，因为一个term只有一个leader，因此不会收到不是leader的AppendEntries
-			reply.Success = false
-		}
-	} else {	//任期高,直接成为该节点的follower
+	} else {	//args.Term >= rf.currentTerm
+		reply.Success = true
+		//可能是低任期或者同任期的candidate，
 		rf.ConvToFollower(args.Term, args.LeaderId)
-		reply.Term = rf.currentTerm
-		reply.Success = false
+	}
+}
+
+
+func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,}
+			rf.lastApplied += 1
+		DPrintf("[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+		rf.mu.Unlock()
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
