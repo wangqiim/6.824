@@ -47,6 +47,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 
@@ -613,7 +614,9 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.lastApplied - 1].Command,
-				CommandIndex: rf.lastApplied}
+				CommandIndex: rf.lastApplied,
+				CommandTerm:  rf.log[rf.lastApplied - 1].Term,
+			}
 				
 			rf.mu.Unlock()
 			applyCh <- msg

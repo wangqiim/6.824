@@ -3,11 +3,17 @@ package kvraft
 import "../labrpc"
 import "crypto/rand"
 import "math/big"
+import "time"
+//import "sync/atomic"
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	//每一个客户端单独串行发请求，并不需要上锁
+	clientId 	int64
+	seqId		int64
+	leaderId	int
 }
 
 func nrand() int64 {
@@ -21,6 +27,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+
+	ck.leaderId = 0
+	ck.seqId	= 0
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -37,9 +47,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
+	args := GetArgs{}
+	args.Key = key
+	args.ClientId = ck.clientId
+	args.SeqId = ck.seqId
+	ck.seqId++
+	//DPrintf("Client[%d] Get(), key = %s", ck.clientId, key)
+	reply := GetReply{}	
+	for {
+		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		if (ok) {
+			if (reply.Err == OK) {
+				break;
+			} else if (reply.Err == ErrNoKey) {
+				return ""
+			}
+		}
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(time.Millisecond)
+	}
 	// You will have to modify this function.
-	return ""
+	DPrintf("Client[%d] Get(%s)=%v", ck.clientId, key, reply.Value)
+	return reply.Value
 }
 
 //
@@ -54,6 +83,25 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{}
+	args.Key	= key
+	args.Value	= value
+	args.Op		= op
+	args.ClientId = ck.clientId
+	args.SeqId = ck.seqId
+	ck.seqId++
+	//DPrintf("Client[%d] PutAppend(), key = %s,value = %s, op = %s", ck.clientId, key, value, op)
+	reply := PutAppendReply{}
+	
+	for {
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		if (ok && reply.Err == OK) {
+			break;
+		}
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(time.Millisecond)
+	}
+	DPrintf("Client[%d] %v(%v, %v)", ck.clientId, op, key, value)
 }
 
 func (ck *Clerk) Put(key string, value string) {
