@@ -239,8 +239,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	
 	reply.Term = rf.currentTerm
 	reply.Success = false
-	reply.ConflictIndex = 0
-	reply.ConflictTerm = 0
+	reply.ConflictIndex = -1
+	reply.ConflictTerm = -1
 
 	if (args.Term < rf.currentTerm) {
 		return
@@ -248,41 +248,59 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ConvToFollower(args.Term, args.LeaderId)
 		rf.persist()
 	}
-	if (len(rf.log) < args.PrevLogIndex) {
-		reply.ConflictIndex = len(rf.log)
-		if (reply.ConflictIndex != 0) {
-			reply.ConflictTerm = rf.log[reply.ConflictIndex - 1].Term
-		}
+
+	// 如果prevLogIndex在快照内，且不是快照最后一个log，那么只能从index=1开始同步了
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		reply.ConflictIndex = 1
 		return
-	}
-	//任期不匹配，则直接返回
-	if (args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm) {
-		reply.ConflictTerm = rf.log[args.PrevLogIndex - 1].Term
-		for index := 1; index <= args.PrevLogIndex; index++ {
-			if (rf.log[index - 1].Term == reply.ConflictTerm) {
-				reply.ConflictIndex = index;
-				break
+	} else if args.PrevLogIndex == rf.lastIncludedIndex {	// prevLogIndex正好等于快照的最后一个log
+		if args.PrevLogTerm != rf.lastIncludedTerm {	// 冲突了，那么从index=1开始同步吧
+			reply.ConflictIndex = 1
+			return
+		}
+		// 否则继续走后续的日志覆盖逻辑
+	} else {	// prevLogIndex在快照之后，那么进一步判定
+		if args.PrevLogIndex > rf.lastIndex() {	// prevLogIndex位置没有日志的case
+			reply.ConflictIndex = rf.lastIndex() + 1
+			return
+		}
+		// prevLogIndex位置有日志，那么判断term必须相同，否则false
+		if rf.log[rf.index2LogPos(args.PrevLogIndex)].Term != args.PrevLogTerm {
+			reply.ConflictTerm = rf.log[rf.index2LogPos(args.PrevLogIndex)].Term
+			for index := rf.lastIncludedIndex + 1; index <= args.PrevLogIndex; index++ { // 找到冲突term的首次出现位置，最差就是PrevLogIndex
+				if rf.log[rf.index2LogPos(index)].Term == reply.ConflictTerm {
+					reply.ConflictIndex = index
+					break
+				}
 			}
+			return
 		}
-		return
+		// 否则继续走后续的日志覆盖逻辑
 	}
+
 	// 保存日志
 	for i, logEntry := range args.Entries {
-		index := args.PrevLogIndex + i + 1
-		if index > len(rf.log) {
+		index := args.PrevLogIndex + 1 + i
+		logPos := rf.index2LogPos(index)
+		if index > rf.lastIndex() {	// 超出现有日志长度，继续追加
 			rf.log = append(rf.log, logEntry)
-		} else {	// 重叠部分
-			if rf.log[index - 1].Term != logEntry.Term {
-				rf.log = rf.log[:index - 1]		// 删除当前以及后续所有log
-				rf.log = append(rf.log, logEntry)	// 把新log加入进来
-			}	// term一样啥也不用做，继续向后比对Log
+		} else { // 重叠部分
+			if rf.log[logPos].Term != logEntry.Term {
+				rf.log = rf.log[:logPos]         // 删除当前以及后续所有log
+				rf.log = append(rf.log, logEntry) // 把新log加入进来
+			} // term一样啥也不用做，继续向后比对Log
 		}
 	}
-	if (args.LeaderCommit > rf.commitIndex) {
+	rf.persist()
+
+	// 更新提交下标
+	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
+		if rf.lastIndex() < rf.commitIndex {
+			rf.commitIndex = rf.lastIndex()
+		}
 	}
 	reply.Success = true
-	rf.persist()
 }
 
 //
@@ -495,6 +513,11 @@ func (rf *Raft) Heartbeat(heartbeatTerm int) {
 		if (server == rf.me) {
 			continue;
 		}
+		if rf.nextIndex[server] <= rf.lastIncludedIndex {	//安装快照
+			//rf.doInstallSnapshot(server)
+			continue
+		}
+		//正常复制日志
 		args := AppendEntriesArgs{}
 		args.Term = rf.currentTerm
 		args.LeaderId = rf.me
@@ -502,17 +525,13 @@ func (rf *Raft) Heartbeat(heartbeatTerm int) {
 		args.PrevLogTerm = 0
 		args.Entries = make([]LogEntry, 0)
 		args.LeaderCommit = rf.commitIndex
-		if (args.PrevLogIndex > 0) {	//log数组索引从0开始
-			// if (args.PrevLogIndex > len(rf.log)) {
-			// 	fmt.Println(args.PrevLogIndex, " > ", len(rf.log))
-			// }
-			args.PrevLogTerm = rf.log[args.PrevLogIndex - 1].Term
+		if args.PrevLogIndex == rf.lastIncludedIndex {
+			args.PrevLogTerm = rf.lastIncludedTerm
+		} else { // 否则一定是log部分
+			args.PrevLogTerm = rf.log[rf.index2LogPos(args.PrevLogIndex)].Term
 		}
 		// fmt.Printf("[%d] state = %d,rf.nextIndex[%d] = %d", rf.me, rf.state, server, rf.nextIndex[server])
-		args.Entries = append(args.Entries, rf.log[rf.nextIndex[server] - 1:]...)
-		// if (len(args.Entries) + rf.nextIndex[server] - 1 >= len(rf.log)) {
-		// 	fmt.Println("wwwwqqqqq")
-		// }
+		args.Entries = append(args.Entries, rf.log[rf.index2LogPos(args.PrevLogIndex+1):]...)
 		go rf.CallAppendEntries(server, &args) //process reply in proxy function
 	}
 	rf.mu.Unlock()
@@ -545,7 +564,7 @@ func (rf *Raft) CallAppendEntries(server int, args *AppendEntriesArgs) {
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 
 		sortedMatchIndex := make([]int, 0)
-		sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
+		sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
 		for server := 0; server < len(rf.peers); server++ {
 			if server == rf.me {
 				continue
@@ -554,24 +573,27 @@ func (rf *Raft) CallAppendEntries(server int, args *AppendEntriesArgs) {
 		}
 		sort.Ints(sortedMatchIndex)
 		newCommitIndex := sortedMatchIndex[len(rf.peers) / 2]
-		if (newCommitIndex > rf.commitIndex  && rf.log[newCommitIndex - 1].Term == rf.currentTerm) {
+		// 如果index属于snapshot范围，那么不要检查term了，因为snapshot的一定是集群提交的
+		// 否则还是检查log的term是否满足条件
+		if newCommitIndex > rf.commitIndex && (newCommitIndex <= rf.lastIncludedIndex || rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm) {
 			rf.commitIndex = newCommitIndex
 		}
 		//在所有节点中，日志长度在中间位置的那个节点，让所有节点的日志提交到该节点的日志位置
 	} else {
 		//或许要处理一下丢包时的bug，防止在网络中传输过多东西
-		if (reply.ConflictTerm == 0) {
-			rf.nextIndex[server] = reply.ConflictIndex + 1
+		// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+		if (reply.ConflictTerm == -1) {
+			rf.nextIndex[server] = reply.ConflictIndex
 		} else {
-			conflictTermIndex := 0
-			for index := reply.ConflictIndex; index >= 1; index-- {
-				if (rf.log[index - 1].Term == reply.ConflictTerm) {
+			conflictTermIndex := -1
+			for index := reply.ConflictIndex; index > rf.lastIncludedIndex; index-- {
+				if (rf.log[rf.index2LogPos(index)].Term == reply.ConflictTerm) {
 					conflictTermIndex = index
 					break;
 				}
 			}
-			if (conflictTermIndex != 0) {
-				rf.nextIndex[server] = conflictTermIndex + 1
+			if (conflictTermIndex != -1) {
+				rf.nextIndex[server] = conflictTermIndex
 			} else {
 				rf.nextIndex[server] = reply.ConflictIndex
 			}
