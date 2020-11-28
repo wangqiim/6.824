@@ -8,17 +8,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
 
-
 const (
-	OpPut 	 = "Put"
-	OpAppend = "Append"
-	OpGet	 = "Get"
+	OP_TYPE_PUT    = "Put"
+	OP_TYPE_APPEND = "Append"
+	OP_TYPE_GET    = "Get"
 )
-
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		log.Printf(format, a...)
@@ -34,14 +33,14 @@ type Op struct {
 	Term	int
 	Key 	string
 	Value 	string
-	OpType	string	//Put, Append, Get
+	Type	string	//Put, Append, Get
 	ClientId 	int64
 	SeqId 		int64
 }
 
 // 等待Raft提交期间的Op上下文, 用于唤醒阻塞的RPC
 type OpContext struct {
-	op Op
+	op        *Op
 	committed 	chan struct{}
 
 	wrongLeader bool 	// 因为index位置log的term不一致, 说明leader换过了
@@ -62,22 +61,23 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db 		map[string]string	//应用层数据库
+	kvStore map[string]string  // kv存储
 	reqMap	map[int]*OpContext	//log index -> 请求上下文
 	seqMap	map[int64]int64 	//查看每个client的日志提交到哪个位置了。	
+	lastAppliedIndex int // 已应用到kvStore的日志index
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := Op{}
+	op := &Op{}
 	op.Key		= args.Key
-	op.OpType	= OpGet
+	op.Type	= OP_TYPE_GET
 	op.SeqId	= args.SeqId
 	op.ClientId	= args.ClientId
 	var isLeader bool
 	op.Index, op.Term, isLeader = kv.rf.Start(op)
 	if (!isLeader) {
-		reply.Err = ErrWrongLeader 
+		reply.Err = ErrWrongLeader
 		return
 	}
 	//DPrintf("[KVserver]Key=%v, value=%s, op=%v", op.Key, op.Value, op.Op)
@@ -109,8 +109,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		//超时或处理完毕则清理上下文
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		if opContext, ok := kv.reqMap[op.Index]; ok {
-			if (opContext == opCtx) {
+		if one, ok := kv.reqMap[op.Index]; ok {
+			if (one == opCtx) {
 				delete(kv.reqMap, op.Index)
 			}
 		}
@@ -119,17 +119,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := Op{}
+	op := &Op{}
 	op.Key = args.Key
 	op.Value = args.Value
-	op.OpType = args.Op
+	op.Type = args.Op
 	op.ClientId = args.ClientId
 	op.SeqId = args.SeqId
 
 	var isLeader bool
 	op.Index, op.Term, isLeader = kv.rf.Start(op)
 	if (isLeader == false) {
-		reply.Err = ErrWrongLeader 
+		reply.Err = ErrWrongLeader
 		return
 	}
 	//DPrintf("[%d] PutAppend RPC,OpType=%v, Key=%v, Value=%v", kv.me, args.Op, args.Key, args.Value)
@@ -141,19 +141,19 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.reqMap[op.Index] = opCtx
 	kv.mu.Unlock()
 	select {
-	case <-opCtx.committed:	// 如果提交了
-		if opCtx.wrongLeader {	// 同样index位置的term不一样了, 说明leader变了，需要client向新leader重新写入
+		case <-opCtx.committed:	// 如果提交了
+			if opCtx.wrongLeader {	// 同样index位置的term不一样了, 说明leader变了，需要client向新leader重新写入
+				reply.Err = ErrWrongLeader
+			} else {
+				reply.Err = OK
+			}
+		case <-time.After(2 * time.Second):	
 			reply.Err = ErrWrongLeader
-		} else {
-			reply.Err = OK
+			DPrintf("[KVserver]%v(%v, %v) timeout 2s", args.Op, args.Key, args.Value)
 		}
-	case <-time.After(2 * time.Second):	
-		reply.Err = ErrWrongLeader
-        DPrintf("[KVserver]%v(%v, %v) timeout 2s", args.Op, args.Key, args.Value)
-	}
 	//DPrintf("[%d] PutAppend RPC,OpType=%v, Key=%v, Value=%v, reply.Err=%v", kv.me, args.Op, args.Key, args.Value, reply.Err)
 	func() {
-	//超时或者已经处理，则清理上下文
+		//超时或者已经处理，则清理上下文
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
 		if one, ok := kv.reqMap[op.Index]; ok {
@@ -187,49 +187,107 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applyLoop() {
 	for !kv.killed() {
-		applyMsg  := <-kv.applyCh
-		op := applyMsg.Command.(Op)
-		index := applyMsg.CommandIndex
-		term := applyMsg.CommandTerm
-		//DPrintf("[%d] applyloop,index=%v,OpType=%v,Key=%v,Value=%v", kv.me, index, op.OpType, op.Key, op.Value)
-		func() {
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			//DPrintf("[%v]kv.reqMap=%v", kv.me, kv.reqMap)
-			opCtx, existOpt := kv.reqMap[index]
-			prevSeq, existSeq := kv.seqMap[op.ClientId]
-			
-			//分析了一下，实际上请求号顶多相等，并不会op.SeqId < prevSeq的情况。
-			if (!existSeq || op.SeqId > prevSeq) {
-				kv.seqMap[op.ClientId] = op.SeqId
-			}
-
-			if (op.OpType == OpPut || op.OpType == OpAppend) {
-				if (!existSeq || op.SeqId > prevSeq) {	//第一次记录该客户端，或者请求号是递增的
-					if (op.OpType == OpPut) {
-						kv.db[op.Key] = op.Value
+		select {
+		case msg := <-kv.applyCh:
+			// 如果是安装快照
+			if !msg.CommandValid {
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					if len(msg.Snapshot) == 0 {	// 空快照，清空数据
+						kv.kvStore = make(map[string]string)
+						kv.seqMap = make(map[int64]int64)
 					} else {
-						if _, exist := kv.db[op.Key]; exist {
-							kv.db[op.Key] += op.Value
-						} else {
-							kv.db[op.Key] = op.Value
+						// 反序列化快照, 安装到内存
+						r := bytes.NewBuffer(msg.Snapshot)
+						d := labgob.NewDecoder(r)
+						d.Decode(&kv.kvStore)
+						d.Decode(&kv.seqMap)
+					}
+					// 已应用到哪个索引
+					kv.lastAppliedIndex = msg.LastIncludedIndex
+					//DPrintf("KVServer[%d] installSnapshot, kvStore[%v], seqMap[%v] lastAppliedIndex[%v]", kv.me, len(kv.kvStore), len(kv.seqMap), kv.lastAppliedIndex)
+				}()
+			} else { // 如果是普通log
+				cmd := msg.Command
+				index := msg.CommandIndex
+
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+
+					// 更新已经应用到的日志
+					kv.lastAppliedIndex = index
+
+					// 操作日志
+					op := cmd.(*Op)
+
+					opCtx, existOp := kv.reqMap[index]
+					prevSeq, existSeq := kv.seqMap[op.ClientId]
+					kv.seqMap[op.ClientId] = op.SeqId
+
+					if existOp { // 存在等待结果的RPC, 那么判断状态是否与写入时一致
+						if opCtx.op.Term != op.Term {
+							opCtx.wrongLeader = true
 						}
 					}
-				}
-			}
 
-			if (existOpt == true) {	// 存在等待结果的RPC, 那么判断状态是否与写入时一致
-				if opCtx.op.Term != term {
-					opCtx.wrongLeader = true
-				}
-				if (op.OpType == OpGet) {
-					opCtx.value, opCtx.keyExist = kv.db[op.Key]
-				} else if (op.OpType == OpPut || op.OpType == OpAppend) {
-					//可能是重复请求的，则老的rpc肯定已经断了，此处无需处理
-				}
-				close(opCtx.committed)
+					// 只处理ID单调递增的客户端写请求
+					if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_APPEND {
+						if !existSeq || op.SeqId > prevSeq { // 如果是递增的请求ID，那么接受它的变更
+							if op.Type == OP_TYPE_PUT { // put操作
+								kv.kvStore[op.Key] = op.Value
+							} else if op.Type == OP_TYPE_APPEND { // put-append操作
+								if val, exist := kv.kvStore[op.Key]; exist {
+									kv.kvStore[op.Key] = val + op.Value
+								} else {
+									kv.kvStore[op.Key] = op.Value
+								}
+							}
+						}
+					} else { // OP_TYPE_GET
+						if existOp {
+							opCtx.value, opCtx.keyExist = kv.kvStore[op.Key]
+						}
+					}
+					//DPrintf("KVServer[%d] applyLoop, kvStore[%v]", kv.me, len(kv.kvStore))
+
+					// 唤醒挂起的RPC
+					if existOp {
+						close(opCtx.committed)
+					}
+				}()
+			}
+		}
+	}
+}
+
+func (kv *KVServer) snapshotLoop() {
+	for !kv.killed() {
+		var snapshot []byte
+		var lastIncludedIndex int
+		// 锁内dump snapshot
+		func() {
+			// 如果raft log超过了maxraftstate大小，那么对kvStore快照下来
+			if kv.maxraftstate != -1 && kv.rf.ExceedLogSize(kv.maxraftstate) {	// 这里调用ExceedLogSize不要加kv锁，否则会死锁
+				// 锁内快照，离开锁通知raft处理
+				kv.mu.Lock()
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.kvStore)	// kv键值对
+				e.Encode(kv.seqMap)	// 当前各客户端最大请求编号，也要随着snapshot走
+				snapshot = w.Bytes()
+				lastIncludedIndex = kv.lastAppliedIndex
+				DPrintf("KVServer[%d] KVServer dump snapshot, snapshotSize[%d] lastAppliedIndex[%d]", kv.me, len(snapshot), kv.lastAppliedIndex)
+				kv.mu.Unlock()
 			}
 		}()
+		// 锁外通知raft层截断，否则有死锁
+		if snapshot != nil {
+			// 通知raft落地snapshot并截断日志（都是已提交的日志，不会因为主从切换截断，放心操作）
+			kv.rf.TakeSnapshot(snapshot, lastIncludedIndex)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -250,21 +308,27 @@ func (kv *KVServer) applyLoop() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(&Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-	kv.applyCh = make(chan raft.ApplyMsg)
+
+	kv.applyCh = make(chan raft.ApplyMsg, 1)	// 至少1个容量，启动后初始化snapshot用
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.db = make(map[string]string)
-	kv.reqMap = make(map[int]*OpContext)
-	kv.seqMap = make(map[int64]int64)
 
 	// You may need initialization code here.
+	kv.kvStore = make(map[string]string)
+	kv.reqMap = make(map[int]*OpContext)
+	kv.seqMap = make(map[int64]int64)
+	kv.lastAppliedIndex = 0
+
+	//DPrintf("KVServer[%d] KVServer starts all Loops, maxraftstate[%d]", kv.me,  kv.maxraftstate)
+
 	go kv.applyLoop()
+	go kv.snapshotLoop()
 
 	return kv
 }

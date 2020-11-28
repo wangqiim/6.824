@@ -52,7 +52,7 @@ func (ck *Clerk) Get(key string) string {
 	args.ClientId = ck.clientId
 	args.SeqId = ck.seqId
 	ck.seqId++
-	//DPrintf("Client[%d] Get(), key = %s", ck.clientId, key)
+	//DPrintf("Client[%d] start Get(), key = %s", ck.clientId, key)
 	reply := GetReply{}	
 	for {
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
@@ -90,7 +90,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.ClientId = ck.clientId
 	args.SeqId = ck.seqId
 	ck.seqId++
-	//DPrintf("Client[%d] PutAppend(), key = %s,value = %s, op = %s", ck.clientId, key, value, op)
+	//DPrintf("Client[%d] start PutAppend(), key = %s,value = %s, op = %s", ck.clientId, key, value, op)
 	reply := PutAppendReply{}
 	
 	for {

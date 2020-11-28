@@ -48,6 +48,11 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
+
+	// 向application层安装快照
+	Snapshot []byte
+	LastIncludedIndex int
+	LastIncludedTerm int
 }
 
 
@@ -84,7 +89,12 @@ type Raft struct {
 	electTimeTick		int	//0 -> electDuration
 	heartbeatTick		int	//0 -> hearbeatDuration
 	electDuration		int	//ms
-	
+	lastActiveTime    time.Time // 上次活跃时间（刷新时机：收到leader心跳、给其他candidates投票、请求其他节点投票）
+	lastBroadcastTime time.Time // 作为leader，上次的广播时间
+
+	lastIncludedIndex	int 	// snapshot最后1个logEntry的index，没有snapshot则为0
+	lastIncludedTerm 	int 	// snapthost最后1个logEntry的term，没有snaphost则无意义
+	applyCh 			chan ApplyMsg	// 应用层的提交队列
 }
 
 // return currentTerm and whether this server
@@ -105,14 +115,21 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	// DPrintf("[%d] persist starts", rf.me)
+	data := rf.raftStateForPersist()
+	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) raftStateForPersist() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
-	// DPrintf("[%d] persist starts", rf.me)
-	rf.persister.SaveRaftState(data)
+	return data
 }
 
 //
@@ -123,14 +140,16 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// DPrintf("[%d] readPersist starts", rf.me)
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if 	d.Decode(&rf.currentTerm) != nil ||  d.Decode(&rf.votedFor) != nil || d.Decode(&rf.log) != nil {
-		//DPrintf("[%d] readPersist starts errors!", rf.me)
-	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
+	// 为了snaphost多做了2个持久化的metadata
+	d.Decode(&rf.lastIncludedIndex)
+	d.Decode(&rf.lastIncludedTerm)
 }
 
 //
@@ -184,9 +203,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	//要么最新的日志任期比我新，如果任期相同 则日志至少和我一样多，我才给你投票
-	index := len(rf.log) - 1
-	if (index == -1 || args.LastLogTerm > rf.log[index].Term || 
-		((args.LastLogTerm == rf.log[index].Term) && (args.LastLogIndex >= index + 1))) {
+	if (rf.lastIndex() == 0 || args.LastLogTerm > rf.lastTerm() || 
+		((args.LastLogTerm == rf.lastTerm()) && (args.LastLogIndex >= rf.lastIndex()))) {
 			if (args.Term < rf.currentTerm) {
 				return
 			} else if (args.Term == rf.currentTerm){	//args.Term > rf.currentTerm
@@ -400,11 +418,8 @@ func (rf *Raft) AttemptElection(electTerm int) {
 	finishCount := 1	//已经完成的投票
 	votes := 1
 	term := rf.currentTerm	//Eliminate race
-	lastlogindex := len(rf.log)
-	lastLogTerm := 0
-	if (len(rf.log) > 0) {
-		lastLogTerm = rf.log[len(rf.log) - 1].Term
-	}
+	lastlogindex := rf.lastIndex()
+	lastLogTerm := rf.lastTerm()
 	rf.mu.Unlock()
 	
 	for server, _ := range rf.peers {
@@ -611,16 +626,15 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 		rf.mu.Lock()
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied += 1
+			appliedIndex := rf.index2LogPos(rf.lastApplied)
 			msg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied - 1].Command,
+				Command:      rf.log[appliedIndex].Command,
 				CommandIndex: rf.lastApplied,
-				CommandTerm:  rf.log[rf.lastApplied - 1].Term,
+				CommandTerm:  rf.log[appliedIndex].Term,
 			}
 				
-			rf.mu.Unlock()
 			applyCh <- msg
-			rf.mu.Lock()
 			//DPrintf("[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d], Len(rf.log)[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex, len(rf.log))
 		}		
 		rf.mu.Unlock()
@@ -656,12 +670,100 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			matchIndex:		make([]int, len(peers)),
 			electTimeTick:	0,
 			heartbeatTick: 	0,
-			electDuration:	duration}
+			electDuration:	duration,
+			lastIncludedIndex:	0,
+			lastIncludedTerm:	0,
+			applyCh:			applyCh}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	
+	// 向application层安装快照
+	rf.installSnapshotToApplication()
 	rf.persist()
 	go rf.applyLogLoop(applyCh)
 	go rf.electionLoop()
 	go rf.appendEntriesLoop()
 	return rf
+}
+
+
+func (rf *Raft) installSnapshotToApplication() {
+	var applyMsg *ApplyMsg
+
+	// 同步给application层的快照
+	applyMsg = &ApplyMsg{
+		CommandValid: false,
+		Snapshot: rf.persister.ReadSnapshot(),
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm: rf.lastIncludedTerm,
+	}
+	// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
+	rf.lastApplied = rf.lastIncludedIndex
+
+	DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
+	rf.applyCh <- *applyMsg
+	return
+}
+
+// 最后的index
+func (rf *Raft) lastIndex() int {
+	return rf.lastIncludedIndex + len(rf.log)
+}
+
+// 最后的term
+func (rf *Raft) lastTerm() (lastLogTerm int) {
+	lastLogTerm = rf.lastIncludedTerm	// for snapshot
+	if len(rf.log) != 0 {
+		lastLogTerm = rf.log[len(rf.log)-1].Term
+	}
+	return
+}
+
+// 日志index转化成log数组下标
+func (rf *Raft) index2LogPos(index int) (pos int) {
+	return index - rf.lastIncludedIndex - 1
+}
+
+// 日志是否需要压缩
+func (rf *Raft) ExceedLogSize(logSize int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.persister.RaftStateSize() >= logSize {
+		return true
+	}
+	return false
+}
+
+// 保存snapshot，截断log
+func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 已经有更大index的snapshot了
+	if lastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	// 快照的当前元信息
+	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.votedFor==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
+
+	// 要压缩的日志长度
+	compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
+
+	// 更新快照元信息
+	rf.lastIncludedTerm = rf.log[rf.index2LogPos(lastIncludedIndex)].Term
+	rf.lastIncludedIndex = lastIncludedIndex
+
+	// 压缩日志
+	afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
+	copy(afterLog, rf.log[compactLogLen:])
+	rf.log = afterLog
+
+	// 把snapshot和raftstate持久化
+	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
+
+	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.votedFor==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 }
