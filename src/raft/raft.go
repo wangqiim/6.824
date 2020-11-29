@@ -191,6 +191,20 @@ type AppendEntriesReply struct {
 	ConflictTerm int
 }
 
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Offset int
+	Data []byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -226,7 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 	if (reply.VoteGranted == true) {
-		DPrintf("[%d] vote to %d", rf.me, args.CandidateId)
+		//DPrintf("[%d] vote to %d", rf.me, args.CandidateId)
 	}
 	rf.persist()
 	return
@@ -303,6 +317,51 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//DPrintf("RaftNode[%d] installSnapshot starts, rf.lastIncludedIndex[%d] rf.lastIncludedTerm[%d] args.lastIncludedIndex[%d] args.lastIncludedTerm[%d] logSize[%d]", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LastIncludedIndex, args.LastIncludedTerm, len(rf.log))
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 发现更大的任期，则转为该任期的follower
+	if args.Term > rf.currentTerm {
+		rf.ConvToFollower(args.Term, args.LeaderId)
+		rf.persist()
+		// 继续向下走
+	}
+
+	// leader快照不如本地长，那么忽略这个快照
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	} else  {	// leader快照比本地快照长
+		if args.LastIncludedIndex < rf.lastIndex() {	// 快照外还有日志，判断是否需要截断
+			if rf.log[rf.index2LogPos(args.LastIncludedIndex)].Term != args.LastIncludedTerm {
+				rf.log = make([]LogEntry, 0)	// term冲突，扔掉快照外的所有日志
+			} else {	// term没冲突，保留后续日志
+				leftLog := make([]LogEntry, rf.lastIndex() - args.LastIncludedIndex)
+				copy(leftLog, rf.log[rf.index2LogPos(args.LastIncludedIndex)+1:])
+				rf.log = leftLog
+			}
+		} else {
+			rf.log = make([]LogEntry, 0)	// 快照比本地日志长，日志就清空了
+		}
+	}
+	// 更新快照位置
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	// 持久化raft state和snapshot
+	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), args.Data)
+	// snapshot提交给应用层
+	rf.installSnapshotToApplication()
+	//DPrintf("RaftNode[%d] installSnapshot ends, rf.lastIncludedIndex[%d] rf.lastIncludedTerm[%d] args.lastIncludedIndex[%d] args.lastIncludedTerm[%d] logSize[%d]", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LastIncludedIndex, args.LastIncludedTerm, len(rf.log))
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -342,6 +401,11 @@ func (rf *Raft) sendAppendEntriese(server int, args *AppendEntriesArgs, reply *A
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -368,7 +432,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	term = rf.currentTerm
 	rf.log = append(rf.log, LogEntry{command, term})
-	index = len(rf.log)
+	index = rf.lastIndex()
 	//DPrintf("[%d] start agreement, index=%d, currentTerm = %d", rf.me, index, term)
 	// DPrintf("[%d] start agreement, commitIndex=%d, lastApplied=%d",rf.me,rf.commitIndex,rf.lastApplied)
 	rf.persist()
@@ -431,7 +495,7 @@ func (rf *Raft) AttemptElection(electTerm int) {
 		rf.mu.Unlock()
 		return;
 	}
-	DPrintf("[%d] attempting an electing at term %d", rf.me, rf.currentTerm)
+	//DPrintf("[%d] attempting an electing at term %d", rf.me, rf.currentTerm)
 	voteResultChan := make(chan int, len(rf.peers))
 	finishCount := 1	//已经完成的投票
 	votes := 1
@@ -448,7 +512,7 @@ func (rf *Raft) AttemptElection(electTerm int) {
 			voteGranted := rf.CallRequestVote(term, server, lastlogindex, lastLogTerm)
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			DPrintf("[%d] got vote from %d", rf.me, server)
+			//DPrintf("[%d] got vote from %d", rf.me, server)
 			if (voteGranted == true) {
 				votes++
 			}
@@ -505,16 +569,14 @@ func (rf *Raft) Heartbeat(heartbeatTerm int) {
 		rf.mu.Unlock()
 		return
 	}
-	DPrintf("[%d] Heartbeat at term %d", rf.me, rf.currentTerm)
-
+	//DPrintf("[%d] Heartbeat at term %d", rf.me, rf.currentTerm)
 	//在所有节点中，日志长度在中间位置的那个节点，让所有节点的日志提交到该节点的日志位置
-
 	for server, _ := range rf.peers {
 		if (server == rf.me) {
 			continue;
 		}
 		if rf.nextIndex[server] <= rf.lastIncludedIndex {	//安装快照
-			//rf.doInstallSnapshot(server)
+			rf.doInstallSnapshot(server)
 			continue
 		}
 		//正常复制日志
@@ -537,11 +599,65 @@ func (rf *Raft) Heartbeat(heartbeatTerm int) {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) updateCommitIndex() {
+	// 更新commitIndex, 就是找中位数
+	sortedMatchIndex := make([]int, 0)
+	sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
+	}
+	sort.Ints(sortedMatchIndex)
+	newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
+	// 如果index属于snapshot范围，那么不要检查term了，因为snapshot的一定是集群提交的
+	// 否则还是检查log的term是否满足条件
+	if newCommitIndex > rf.commitIndex && (newCommitIndex <= rf.lastIncludedIndex || rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm) {
+		rf.commitIndex = newCommitIndex
+	}
+	//DPrintf("RaftNode[%d] updateCommitIndex, commitIndex[%d] matchIndex[%v]", rf.me, rf.commitIndex, sortedMatchIndex)
+}
+
+func (rf *Raft) doInstallSnapshot(peerId int) {
+	//DPrintf("RaftNode[%d] doInstallSnapshot starts, leaderId[%d] peerId[%d]\n", rf.me, rf.votedFor, peerId)
+	args := InstallSnapshotArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.LastIncludedIndex = rf.lastIncludedIndex
+	args.LastIncludedTerm = rf.lastIncludedTerm
+	args.Offset = 0
+	args.Data = rf.persister.ReadSnapshot()
+	args.Done = true
+
+	reply := InstallSnapshotReply{}
+	go func() {
+		if rf.sendInstallSnapshot(peerId, &args, &reply) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// double check,如果不是rpc前的leader状态了，那么啥也别做了
+			if rf.currentTerm != args.Term {
+				return
+			}
+			if reply.Term > rf.currentTerm { // 变成follower
+				rf.ConvToFollower(reply.Term, -1)
+				rf.persist()
+				return
+			}
+			rf.nextIndex[peerId] = rf.lastIndex() + 1	// 重新从末尾同步log（未经优化，但够用）
+			rf.matchIndex[peerId] = args.LastIncludedIndex	// 已同步到的位置（未经优化，但够用）
+			rf.updateCommitIndex()	// 更新commitIndex
+			//DPrintf("RaftNode[%d] doInstallSnapshot ends, leaderId[%d] peerId[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]\n", rf.me, rf.votedFor, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId], rf.commitIndex)
+		}
+	}()
+}
+
 func (rf *Raft) CallAppendEntries(server int, args *AppendEntriesArgs) {
 	reply := AppendEntriesReply{}
-	DPrintf("[%d] sending Append Entries to %d", rf.me, server)
+	//DPrintf("[%d] sending Append Entries to %d", rf.me, server)
 	ok := rf.sendAppendEntriese(server, args, &reply)
-	DPrintf("[%d] finish Append Entries to %d, ok = %v", rf.me, server, ok)
+	//DPrintf("[%d] finish Append Entries to %d, ok = %v", rf.me, server, ok)
 	if (ok == false) {
 		return
 	}
@@ -562,22 +678,7 @@ func (rf *Raft) CallAppendEntries(server int, args *AppendEntriesArgs) {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 		}
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
-
-		sortedMatchIndex := make([]int, 0)
-		sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
-		for server := 0; server < len(rf.peers); server++ {
-			if server == rf.me {
-				continue
-			}
-			sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[server])
-		}
-		sort.Ints(sortedMatchIndex)
-		newCommitIndex := sortedMatchIndex[len(rf.peers) / 2]
-		// 如果index属于snapshot范围，那么不要检查term了，因为snapshot的一定是集群提交的
-		// 否则还是检查log的term是否满足条件
-		if newCommitIndex > rf.commitIndex && (newCommitIndex <= rf.lastIncludedIndex || rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm) {
-			rf.commitIndex = newCommitIndex
-		}
+		rf.updateCommitIndex()
 		//在所有节点中，日志长度在中间位置的那个节点，让所有节点的日志提交到该节点的日志位置
 	} else {
 		//或许要处理一下丢包时的bug，防止在网络中传输过多东西
@@ -677,7 +778,7 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	duration := rand.Intn(15) * 10 + 150	//[150,290] 10的倍数
 	// duration := rand.Intn(150) + 150	//[150,300) 
-	DPrintf("[%d] Make and duration is %d Millisecond", me, duration)
+//ntf("[%d] Make and duration is %d Millisecond", me, duration)
 	rf := &Raft{peers:			peers, 
 			persister:		persister, 
 			me: 			me,
@@ -722,8 +823,7 @@ func (rf *Raft) installSnapshotToApplication() {
 	// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
 	rf.lastApplied = rf.lastIncludedIndex
 
-	DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
-		rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
+	//DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]", rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
 	rf.applyCh <- *applyMsg
 	return
 }
@@ -751,6 +851,7 @@ func (rf *Raft) index2LogPos(index int) (pos int) {
 func (rf *Raft) ExceedLogSize(logSize int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	
 	if rf.persister.RaftStateSize() >= logSize {
 		return true
 	}
@@ -768,7 +869,7 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	}
 
 	// 快照的当前元信息
-	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader=%v snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
 		rf.me, rf.votedFor==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 
 	// 要压缩的日志长度
@@ -786,6 +887,6 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	// 把snapshot和raftstate持久化
 	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
 
-	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader=%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
 		rf.me, rf.votedFor==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 }
