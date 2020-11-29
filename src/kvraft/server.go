@@ -75,7 +75,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op.SeqId	= args.SeqId
 	op.ClientId	= args.ClientId
 	var isLeader bool
-	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	op.Index, op.Term, isLeader = kv.rf.Start(*op)
 	if (!isLeader) {
 		reply.Err = ErrWrongLeader
 		return
@@ -127,7 +127,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op.SeqId = args.SeqId
 
 	var isLeader bool
-	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	op.Index, op.Term, isLeader = kv.rf.Start(*op)
 	if (isLeader == false) {
 		reply.Err = ErrWrongLeader
 		return
@@ -211,6 +211,7 @@ func (kv *KVServer) applyLoop() {
 			} else { // 如果是普通log
 				cmd := msg.Command
 				index := msg.CommandIndex
+				term := msg.CommandTerm
 
 				func() {
 					kv.mu.Lock()
@@ -220,14 +221,14 @@ func (kv *KVServer) applyLoop() {
 					kv.lastAppliedIndex = index
 
 					// 操作日志
-					op := cmd.(*Op)
+					op := cmd.(Op)
 
 					opCtx, existOp := kv.reqMap[index]
 					prevSeq, existSeq := kv.seqMap[op.ClientId]
 					kv.seqMap[op.ClientId] = op.SeqId
 
 					if existOp { // 存在等待结果的RPC, 那么判断状态是否与写入时一致
-						if opCtx.op.Term != op.Term {
+						if opCtx.op.Term != term {
 							opCtx.wrongLeader = true
 						}
 					}
@@ -308,7 +309,7 @@ func (kv *KVServer) snapshotLoop() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(&Op{})
+	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
