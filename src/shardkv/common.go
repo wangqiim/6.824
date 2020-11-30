@@ -27,6 +27,10 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	
+	Shard		int
+	ClientId	int64
+	SeqId		int64
 }
 
 type PutAppendReply struct {
@@ -36,9 +40,35 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+
+	Shard		int
+	ClientId	int64
+	SeqId		int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+
+type MigrateArgs struct {
+    Shard     int
+    ConfigNum int
+}
+
+type MigrateReply struct {
+    Err			Err
+    ConfigNum	int
+    Shard		int
+    KvStore		map[string]string
+    SeqMap		map[int64]int64
+}
+
+func Max(a, b int64) int64 {
+	if (a > b) {
+		return a
+	} else {
+		return b
+	}
 }

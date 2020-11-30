@@ -352,7 +352,7 @@ func (sm *ShardMaster) applyLoop() {
 // me is the index of the current server in servers[].
 //
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardMaster {
-	DPrintf("shardmaster[%d]StartServer", me)
+	//DPrintf("shardmaster[%d]StartServer", me)
 	sm := new(ShardMaster)
 	sm.me = me
 

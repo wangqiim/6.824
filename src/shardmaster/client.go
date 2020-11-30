@@ -9,12 +9,14 @@ import "time"
 import "crypto/rand"
 import "math/big"
 
+import "sync/atomic"
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
 	clientId 	int64
 	seqId		int64
-	leaderId	int
+	//leaderId	int	//不好保证原子操作
 }
 
 func nrand() int64 {
@@ -29,8 +31,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// Your code here.
 
-	ck.leaderId = 0
-	ck.seqId	= 0
+	//ck.leaderId = 0
+	atomic.StoreInt64(&ck.seqId, 0)
 	ck.clientId = nrand()
 	return ck
 }
@@ -41,19 +43,20 @@ func (ck *Clerk) Query(num int) Config {
 	// Your code here.
 	args.Num = num
 	args.ClientId = ck.clientId
-	args.SeqId = ck.seqId
-	ck.seqId++
+	args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 
 	//DPrintf("Client[%d] start Query(num), num = %v", ck.clientId, num)
 	for {
 		// try each known server.
-		var reply QueryReply
-		ok := ck.servers[ck.leaderId].Call("ShardMaster.Query", args, &reply)
-		if ok && reply.WrongLeader == false {
-			DPrintf("Client[%d] finish Query(%v) = %v", ck.clientId, num, reply.Config)
-			return reply.Config
+		for _, srv := range ck.servers {
+			var reply QueryReply
+			ok := srv.Call("ShardMaster.Query", args, &reply)
+			if ok && reply.WrongLeader == false {
+				//DPrintf("Client[%d] finish Query(%v) = %v", ck.clientId, num, reply.Config)
+				return reply.Config
+			}
 		}
-		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -64,8 +67,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	// Your code here.
 	args.Servers = servers
 	args.ClientId = ck.clientId
-	args.SeqId = ck.seqId
-	ck.seqId++
+	args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 
 	DPrintf("Client[%d] start Join(servers), servers = %v", ck.clientId, servers)
 	for {
@@ -86,8 +88,7 @@ func (ck *Clerk) Leave(gids []int) {
 	// Your code here.
 	args.GIDs = gids
 	args.ClientId = ck.clientId
-	args.SeqId = ck.seqId
-	ck.seqId++
+	args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 	
 	DPrintf("Client[%d] start Leave(gids), gids = %v", ck.clientId, gids)
 	for {
@@ -110,8 +111,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 	args.Shard = shard
 	args.GID = gid
 	args.ClientId = ck.clientId
-	args.SeqId = ck.seqId
-	ck.seqId++
+	args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 
 	DPrintf("Client[%d] start Leave(shard, gid), shard = %v, gid = %v", ck.clientId, shard, gid)
 	for {

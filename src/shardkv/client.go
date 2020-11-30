@@ -40,6 +40,9 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId 	int64
+	seqId		int64
+	leaderId	int
 }
 
 //
@@ -56,6 +59,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+
+	ck.seqId	= 0
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -68,17 +74,24 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
-
+	
+	args.Shard = key2shard(key)
+	args.ClientId = ck.clientId
+	args.SeqId = ck.seqId
+	ck.seqId++
+	DPrintf("shardkv client[%d] start Get(%v) Shard=%v, config=%v", ck.clientId, key, args.Shard, ck.config)
 	for {
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
+		gid := ck.config.Shards[shard]	//发送请求的shard对应的gid号
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
+				//查询Shards->组号->定位到那一组servers->遍历servers向leader发请求
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					//DPrintf("shardkv client[%d] finish Get(%v)=%v", ck.clientId, key, reply.Value)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -104,8 +117,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
-
+	
+	args.Shard = key2shard(key)
+	args.ClientId = ck.clientId
+	args.SeqId = ck.seqId
+	ck.seqId++
+	DPrintf("shardkv client[%d] start PutAppend(%v, %v) op = %v, shard=%v", ck.clientId, key, value, op, args.Shard)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
